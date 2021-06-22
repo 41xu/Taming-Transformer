@@ -43,8 +43,61 @@ class ResnetBlock(nn.Module):
         output = self.norm1(input)
         output = nonlinear(output)
         output = self.conv1(output)
+
+        output = self.norm2(output)
+        output = nonlinear(output)
+        output = self.dropout(output)
         output = self.conv2(output)
 
+        output = self.shortcut(output)
+
+        return output + input
+
+
+class ResnetStack(nn.Module):
+    def __init__(self, in_channel,out_channel, dropout, n_res_layers):
+        super(ResnetStack, self).__init__()
+        self.stack = nn.ModuleList([ResnetBlock(in_channel, out_channel, dropout=dropout)] * n_res_layers)
+
+    def forward(self, x):
+        for layer in self.stack:
+            x = layer(x)
+        x = F.relu(x)
+        return x
+
+
+class AttnBlock(nn.Module):
+    def __init__(self, in_channel, eps=1e-6):
+        super(AttnBlock, self).__init__()
+        self.norm = nn.GroupNorm(num_groups=32, num_channels=in_channel, eps=eps, affine=True)
+        self.q = nn.Conv2d(in_channel, in_channel, kernel_size=1, stride=1, padding=0)
+        self.k = nn.Conv2d(in_channel, in_channel, kernel_size=1, stride=1, padding=0)
+        self.v = nn.Conv2d(in_channel, in_channel, kernel_size=1, stride=1, padding=0)
+        self.proj_out = nn.Conv2d(in_channel,in_channel, kernel_size=1, stride=1, padding=0)
+
+    def forward(self, input):
+        output = self.norm(input)
+        q = self.q(output)
+        k = self.k(output)
+        v = self.v(output)
+
+        # compute attention
+        b, c, h, w = q.shape
+        q = q.reshape(b, c, h * w)
+        q = q.permute(0, 2, 1) # b, h*w, c
+        k = k.reshape(b, c, h * w) # b, c, h*w
+        w = torch.bmm(q, k) # b, hw, hw
+        w = F.softmax(w, dim=2) # row softmax
+
+        # attend to values
+        v = v.reshape(b, c, h*w)
+        w = w.permute(0, 2, 1) # col softmax, multi v = attention value
+        h = torch.bmm(v, w) # b, c, hw
+        h = h.reshape(b, c, h, w)
+
+        h = self.proj_out(h)
+
+        return input + h # residual connection,
 
 
 
@@ -55,6 +108,7 @@ class ResidualLayer(nn.Module):
     h_dim: hidden layer dim
     res_h_dim: hidden dim of residual block
     residual block: output = input + F(input)
+    abandoned, used in VQ-VAE, but here we use VQ-VAE-2.
     """
     def __init__(self, in_dim, h_dim, res_h_dim):
         super(ResidualLayer, self).__init__()
@@ -88,20 +142,44 @@ class Encoder(nn.Module):
     """
     q_theta(z|x), input x to latent code z
     in_dim, h_dim, residual_dim, n_residual_layers
+    multi resolution layers
+    input: 256x256, downsample: 1, 1, 2, 4, 8 layer
+    ##########
+    h_channel: hidden dim, 128 default
+    z_channel: 256
+    resolution: 256 (256, 256, 3)
+    attn_resolution = [16]
     """
-    def __init__(self, in_dim, h_dim, r_dim, n_residual_layers, kernel=4, stride=2):
+    def __init__(self, in_channel, out_channel, z_channel, h_channel,
+                 n_res_layers, resolution, attn_resolution, ch_mult=(1, 2, 4, 8), dropout=0.0):
         super(Encoder, self).__init__()
-        self.convs = nn.Sequential(
-            nn.Conv2d(in_dim, h_dim // 2, kernel_size=kernel, stride=stride, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(h_dim // 2, h_dim, kernel_size=kernel, stride=stride, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(h_dim, h_dim, kernel_size=kernel-1, stride=stride-1, padding=1),
-        )
+        self.num_resolutions = len(ch_mult) # 4
+        self.num_res_layers = n_res_layers
+        in_ch_mult = (1, ) + tuple(ch_mult) # (1, 1, 2, 4, 8), multi-resolution input channel
+        # input and output channel: (128, 128) -> (128, 128*2) ->(128*2, 128*4) -> (128*4, 128*8)
+
+        # downsample
+        self.conv_in = nn.Conv2d(in_channel, h_channel, kernel_size=3, stride=1, padding=1)
+        self.downsample_layers = nn.ModuleList()
+
+        for i_level in range(self.num_resolutions):
+            res_in, res_out = h_channel * in_ch_mult[i_level], h_channel * ch_mult[i_level]
+            # 这里为了好写multi-resolution的循环，不用加first layer and last layer的判断所以额外加了前面一层1_input_channel
+            for i_block in range(self.num_res_layers):
+                # 这里由于multi-resolution还加了一个attention的原因，所以没有直接用ResnetStack
+                # 不是很清楚为什么在resolution=16的时候加了一个AttenBlock，感觉可以去掉试试看看对比效果
+                pass
+
+
+
+
 
 
     def forward(self, x):
-        return x
+        # bottom layer, downsample
+        pass
+        # middle layer
+        # top layer, end
 
 
 
