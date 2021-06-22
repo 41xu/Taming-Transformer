@@ -18,6 +18,28 @@ def nonlinear(x):
     return x * torch.sigmoid(x)
 
 
+class Downsample(nn.Module):
+    """
+    TODO: asymmetric padding, still confused... maybe in the original VQ-VAE-2 paper...?
+    maybe ACNe? see https://arxiv.org/pdf/1908.03930.pdf and VQ-VAE-2 and also Taming paper for more details
+    """
+    def __init__(self, in_channel, with_conv = True):
+        super(Downsample, self).__init__()
+        self.with_conv = with_conv
+        if self.with_conv:
+            self.conv = nn.Conv2d(in_channel, in_channel, kernel_size=3, stride=2, padding=0)
+
+    def forward(self, x):
+        if self.with_conv:
+            pad = (0, 1, 0, 1)
+            # TODO: still confused, copy from Taming official code
+            x = F.pad(x, pad, mode="constant", value=0)
+            x = self.conv(x)
+        else:
+            x = F.avg_pool2d(x, kernel_size=2, stride=2)
+        return x
+
+
 class ResnetBlock(nn.Module):
     """
     in_channel: input channel or can be seen as dim
@@ -150,8 +172,9 @@ class Encoder(nn.Module):
     resolution: 256 (256, 256, 3)
     attn_resolution = [16]
     """
-    def __init__(self, in_channel, out_channel, z_channel, h_channel,
-                 n_res_layers, resolution, attn_resolution, ch_mult=(1, 2, 4, 8), dropout=0.0):
+    def __init__(self, in_channel, z_channel, h_channel,
+                 n_res_layers, resolution, attn_resolution, ch_mult=(1, 2, 4, 8), dropout=0.0, resample_with_conv=True,
+                 eps=1e-6):
         super(Encoder, self).__init__()
         self.num_resolutions = len(ch_mult) # 4
         self.num_res_layers = n_res_layers
@@ -161,23 +184,43 @@ class Encoder(nn.Module):
         # downsample
         self.conv_in = nn.Conv2d(in_channel, h_channel, kernel_size=3, stride=1, padding=1)
         self.downsample_layers = nn.ModuleList()
+        cur_resolution = resolution
 
         for i_level in range(self.num_resolutions):
+            resstack = nn.ModuleList()
+            attnstack = nn.ModuleList()
+            downstack = nn.ModuleList()
             res_in, res_out = h_channel * in_ch_mult[i_level], h_channel * ch_mult[i_level]
             # 这里为了好写multi-resolution的循环，不用加first layer and last layer的判断所以额外加了前面一层1_input_channel
             for i_block in range(self.num_res_layers):
                 # 这里由于multi-resolution还加了一个attention的原因，所以没有直接用ResnetStack
                 # 不是很清楚为什么在resolution=16的时候加了一个AttenBlock，感觉可以去掉试试看看对比效果
-                pass
+                resstack.append(ResnetBlock(res_in, res_out, dropout=dropout))
+                if cur_resolution in attn_resolution:
+                    attnstack.append(AttnBlock(res_out))
 
+            if i_level != self.num_resolutions - 1: # not last layer, downsample, current resolution need to adjust
+                downstack.append(Downsample(res_out, resample_with_conv))
+                cur_resolution //= 2
 
+            self.downsample_layers.append(resstack)
+            self.downsample_layers.append(attnstack)
+            self.downsample_layers.append(downstack)
 
-
-
+        # middle layer
+        self.middle_layers = nn.ModuleList([
+            ResnetBlock(res_out, res_out, dropout),
+            AttnBlock(res_out),
+            ResnetBlock(res_out, res_out, dropout),
+        ])
+        # last layer, top layer
+        self.out_norm = nn.GroupNorm(num_groups=32, num_channels=res_out, eps=eps, affine=True)
+        self.out_conv = nn.Conv2d(res_out, z_channel, kernel_size=3, stride=1, padding=1)
 
     def forward(self, x):
+        hidden_layers = [self.conv_in(x)]
         # bottom layer, downsample
-        pass
+        x = self.downsample_layers(x)
         # middle layer
         # top layer, end
 
