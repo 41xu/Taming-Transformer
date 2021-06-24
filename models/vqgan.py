@@ -10,13 +10,22 @@ class VQGAN(nn.Module):
     traditional official VQ-VAE-2 input: 256x256, bottom: 64x64, top: 32x32 1, 4, 8 downsample
     Timing: input: 256x256, downsample: 1, 1, 2, 4, 8 layer
     """
-    def __init__(self, in_channel, z_channel, h_channel, n_res_layers, resolution, attn_resolution, embed_dim):
+    def __init__(self, in_channel, z_channel, h_channel, n_res_layers, resolution, attn_resolution,
+                 embed_dim, n_embed, beta=0.25):
         super(VQGAN, self).__init__()
         self.encoder = Encoder(in_channel=in_channel, z_channel=z_channel, h_channel=h_channel,
                                n_res_layers=n_res_layers, resolution=resolution, attn_resolution=attn_resolution)
         self.quant_conv = nn.Conv2d(z_channel, embed_dim, kernel_size=1, stride=1, padding=0)
-        self.quantize = VectorQuantizer()
+        self.quantize = VectorQuantizer(n_embed=n_embed, embed_dim=embed_dim, beta=beta)
+        self.pos_quant_conv = nn.Conv2d(embed_dim, z_channel, kernel_size=1, stride=1, padding=0)
         self.decoder = Decoder()
+
+    def forward(self, x):
+        z = self.encoder(x)
+        z = self.quant_conv(z)
+        quant, embed_loss, info = self.quantize(z)
+        quant = self.pos_quant_conv(quant)
+        dec = self.decoder(quant)
 
 
 
@@ -184,11 +193,12 @@ class Encoder(nn.Module):
         self.num_res_layers = n_res_layers
         in_ch_mult = (1, ) + tuple(ch_mult) # (1, 1, 2, 4, 8), multi-resolution input channel
         # input and output channel: (128, 128) -> (128, 128*2) ->(128*2, 128*4) -> (128*4, 128*8)
+        # and last layer conv input into z_channel(256): 128*8, 256
 
         # downsample
         self.conv_in = nn.Conv2d(in_channel, h_channel, kernel_size=3, stride=1, padding=1)
         self.downsample_layers = nn.ModuleList()
-        cur_resolution = resolution
+        cur_resolution = resolution # 256
 
         for i_level in range(self.num_resolutions):
             resstack = nn.ModuleList()
@@ -206,7 +216,7 @@ class Encoder(nn.Module):
 
             if i_level != self.num_resolutions - 1: # not last layer, downsample, current resolution need to adjust
                 downstack.append(Downsample(res_out, resample_with_conv))
-                cur_resolution //= 2
+                cur_resolution //= 2 # init 256: -> 128, 64, 32
 
             self.downsample_layers.append(resstack)
             self.downsample_layers.append(attnstack)
@@ -223,7 +233,7 @@ class Encoder(nn.Module):
         self.out_conv = nn.Conv2d(res_out, z_channel, kernel_size=3, stride=1, padding=1)
 
     def forward(self, x):
-        x = [self.conv_in(x)]
+        x = self.conv_in(x)
         # bottom layer, downsample
         x = self.downsample_layers(x)
         # middle layer
@@ -232,12 +242,8 @@ class Encoder(nn.Module):
         x = self.out_norm(x)
         x = nonlinear(x)
         x = self.out_conv(x)
+
         return x
-
-
-class Decoder(nn.Module):
-    def __init__(self):
-        super(Decoder, self).__init__()
 
 
 class VectorQuantizer(nn.Module):
@@ -312,13 +318,50 @@ class VectorQuantizer(nn.Module):
             z_q = z_q.view(shape)
             # reshape back
             z_q = z_q.permute(0, 3, 1, 2).contiguous()
-            
+
         return z_q
+
+
+class Decoder(nn.Module):
+    """
+    dual with encoder
+    h_channel: hidden dim, 128 default
+    z_channel: 256
+    resolution: 256 (256, 256, 3)
+    attn_resolution: [16]
+    in_channel: input dim , out_channel: output dim
+    """
+    def __init__(self, in_channel, out_channel, h_channel, z_channel,
+                 n_res_layers, resolution, attn_resolution, ch_mult=(1, 2, 4, 8), dropout=0.0, resample_with_conv=True):
+        super(Decoder, self).__init__()
+        self.num_resolutions = len(ch_mult) # 4
+        self.num_res_layers = n_res_layers
+
+        # top to bottom layer, top with the lowest resolution
+        # upsample, z_channel(256) -> hidden_channel, in and out channel:
+        # encoder里downsample了num_resolutions -1 次（3次），last resolution: 32
+        # （res_in其实应该是output resolution，这里 128 x 8 即超分放大了4倍
+        res_in = h_channel * ch_mult[-1]
+        cur_resolution = resolution // 2 ** (self.num_resolutions - 1)
+        self.z_shape = (1, z_channel, cur_resolution, cur_resolution)
+        print("Working with z of shape {} = {} dimensions.".format(self.z_shape, np.prod(self.z_shape)))
+
+
+    def forward(self, z):
+        self.last_z_shape = z.shape
+        x = self.conv_in(z)
+
+
+
+
 
 
 
 if __name__ == '__main__':
-    model = Encoder(in_channel=3, z_channel=256, h_channel=128, n_res_layers=2, resolution=256, attn_resolution=[16])
+    encoder = Encoder(in_channel=3, z_channel=256, h_channel=128, n_res_layers=2, resolution=256, attn_resolution=[16])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
-    print(model)
+    encoder = encoder.to(device)
+    print(encoder)
+    print("----------")
+    decoder = Decoder()
+    print()
