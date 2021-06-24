@@ -196,6 +196,7 @@ class Encoder(nn.Module):
                 # 这里由于multi-resolution还加了一个attention的原因，所以没有直接用ResnetStack
                 # 不是很清楚为什么在resolution=16的时候加了一个AttenBlock，感觉可以去掉试试看看对比效果
                 resstack.append(ResnetBlock(res_in, res_out, dropout=dropout))
+                res_in = res_out # out_channel update
                 if cur_resolution in attn_resolution:
                     attnstack.append(AttnBlock(res_out))
 
