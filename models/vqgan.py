@@ -298,7 +298,22 @@ class VectorQuantizer(nn.Module):
 
         return z_q, loss, (perplexity, min_encoding, min_encoding_indices)
 
+    def get_codebook_entry(self, indices, shape):
+        """
+        (b, h, w, c）
+        for decode part
+        """
+        min_encoding = torch.zeros(indices.shape[0], self.n_embed).to(indices)
+        min_encoding.scatter_(1, indices[:, None], 1)
 
+        # get quantized latent vector
+        z_q = torch.matmul(min_encoding.float(), self.embedding.weight)
+        if shape is not None:
+            z_q = z_q.view(shape)
+            # reshape back
+            z_q = z_q.permute(0, 3, 1, 2).contiguous()
+            
+        return z_q
 
 
 
