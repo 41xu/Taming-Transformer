@@ -345,7 +345,7 @@ class Decoder(nn.Module):
     attn_resolution: [16]
     in_channel: input dim , out_channel: output dim
     """
-    def __init__(self, in_channel, out_channel, h_channel, z_channel,n_res_layers,
+    def __init__(self, out_channel, h_channel, z_channel,n_res_layers,
                  resolution, attn_resolution, ch_mult=(1, 2, 4, 8), dropout=0.0, resample_with_conv=True, eps=1e-6):
         super(Decoder, self).__init__()
         self.num_resolutions = len(ch_mult) # 4
@@ -392,7 +392,7 @@ class Decoder(nn.Module):
             self.upsample_layers.append(upstack)
 
         # last layer 这里的out_conv和encoder里的conv_in对应, 不过和encoder最后很像，要先out_norm, nonlinear, 最后out_cnov
-        self.out_norm = nn.GroupNorm(num_groups=32, num_channels=res_out, eps=eps, affin=True)
+        self.out_norm = nn.GroupNorm(num_groups=32, num_channels=res_out, eps=eps, affine=True)
         self.out_conv = nn.Conv2d(res_out, out_channel, kernel_size=3, stride=1, padding=1)
 
     def forward(self, z):
@@ -416,5 +416,6 @@ if __name__ == '__main__':
     encoder = encoder.to(device)
     print(encoder)
     print("----------")
-    decoder = Decoder()
-    print()
+    decoder = Decoder(out_channel=3, h_channel=128, z_channel=256, n_res_layers=2, resolution=256, attn_resolution=[16])
+    device = decoder.to(device)
+    print(decoder)
