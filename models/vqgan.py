@@ -10,8 +10,14 @@ class VQGAN(nn.Module):
     traditional official VQ-VAE-2 input: 256x256, bottom: 64x64, top: 32x32 1, 4, 8 downsample
     Timing: input: 256x256, downsample: 1, 1, 2, 4, 8 layer
     """
-    def __init__(self):
+    def __init__(self, in_channel, z_channel, h_channel, n_res_layers, resolution, attn_resolution, embed_dim):
         super(VQGAN, self).__init__()
+        self.encoder = Encoder(in_channel=in_channel, z_channel=z_channel, h_channel=h_channel,
+                               n_res_layers=n_res_layers, resolution=resolution, attn_resolution=attn_resolution)
+        self.quant_conv = nn.Conv2d(z_channel, embed_dim, kernel_size=1, stride=1, padding=0)
+        self.quantize = VectorQuantizer()
+        self.decoder = Decoder()
+
 
 
 def nonlinear(x):
@@ -122,8 +128,6 @@ class AttnBlock(nn.Module):
         return input + h # residual connection,
 
 
-
-
 class ResidualLayer(nn.Module):
     """
     in_dim: input dim
@@ -166,7 +170,7 @@ class Encoder(nn.Module):
     in_dim, h_dim, residual_dim, n_residual_layers
     multi resolution layers
     input: 256x256, downsample: 1, 1, 2, 4, 8 layer
-    ##########
+    ————————————————————
     h_channel: hidden dim, 128 default
     z_channel: 256
     resolution: 256 (256, 256, 3)
@@ -231,18 +235,71 @@ class Encoder(nn.Module):
         return x
 
 
-
-
 class Decoder(nn.Module):
     def __init__(self):
         super(Decoder, self).__init__()
 
 
-
 class VectorQuantizer(nn.Module):
-    def __init__(self):
+    """
+    reference: official code and https://github.com/MishaLaskin/vqvae/blob/d761a999e2267766400dc646d82d3ac3657771d4/models/quantizer.py version
+    discretization
+    encoder output: z(with dim of z_channel in latent space) -> Conv2d into some embedding dim: embed_dim -> quantize
+    learn a codebook,(can be seen as a embedding table), n_embed, embed_dim, beta
+    denote tensor in codebook as e (embed_dim)
+    codebook loss: ||sg[z_e(x)]-e||^2
+    encoder loss: beta*||z_e(x)-sg[e]||^2
+    encoder output: z_e( embed_dim), z_e find nearest e_i in codebook, get q(z|x), e_i: discrete in codebook, one-hot vector
+    ————————————————————
+    input: embed_dim tensor (b, c, h, w) -> flatten into (b*h*w, c)
+    output: z_q (discrete)
+    """
+    def __init__(self, n_embed, embed_dim, beta):
         super(VectorQuantizer, self).__init__()
-        pass
+        self.embed_dim = embed_dim
+        self.n_embed = n_embed
+        self.beta = beta
+        self.embedding = nn.Embedding(self.n_embed, self.embed_dim)
+        self.embedding.weight.data.uniform_(-1. / self.n_embed, 1. / self.n_embed)
+
+    def forward(self, z):
+        z = z.permute(0, 2, 3, 1).contiguous()
+        # reshape: (b, c, h, w) -> (b, h, c, w) and flatten
+        # c is the z_channel(in training process, encoder output z_channel, and conv(z_channel, embed_dim)
+        # therefore c = embed_dim, h*w is the num of tensor
+        # flatten z into (b*h*w, c) <=> (b*h*w, embed_dim)
+        z_flattened = z.view(-1, self.embed_dim)
+        # distances from z to embeddings e_j: (z-e)^2=z^2 + e^2 - 2*e*z
+        # shape: b*h*w,embed_dim, n_embed, embed_dim, therefore z*e.T
+        d = torch.sum(z_flattened ** 2, dim=1, keepdim=True) + torch.sum(self.embedding.weight ** 2, dim=1) - \
+            2 * torch.matmul(z_flattened, self.embedding.weight.t())
+
+        # find closest encodings
+        min_encoding_indices = torch.argmin(d, dim=1).unsqueeze(1)
+        print("min encoding indices shape: ", min_encoding_indices.shape())
+
+        min_encoding = torch.zeros(min_encoding_indices.shape[0], self.n_embed).to(z)
+        min_encoding.scatter_(1, min_encoding_indices, 1)
+        print("min encoding shape: ", min_encoding.shape())
+
+        # TODO: embedding part
+        # quantized latent vector
+        z_q = torch.matmul(min_encoding, self.embedding.weight).view(z.shape)
+
+        # loss for embedding
+        loss = torch.mean((z_q.detach() - z) ** 2) + self.beta * torch.mean((z_q - z.detach()) ** 2)
+        # preserve gradient
+        z_q = z + (z_q - z).detach()
+        # perplexity
+        e_mean = torch.mean(min_encoding, dim=0)
+        perplexity = torch.exp(- torch.sum(e_mean * torch.log(e_mean + 1e-10)))
+        # reshape back to match original input shape, b, c, h, w
+        z_q = z_q.permute(0, 3, 1, 2).contiguous()
+
+        return z_q, loss, (perplexity, min_encoding, min_encoding_indices)
+
+
+
 
 
 if __name__ == '__main__':
