@@ -49,7 +49,7 @@ if __name__ == '__main__':
 
     # ————————————————————
     # load data
-    # dataset
+    # dataset: ADE20K
     # sampler = DistributedSampler(dataset)
     # loader = DataLoader(dataset, batch_szie=batch_size, sampler=sampler)
     # ————————————————————
