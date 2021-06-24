@@ -55,6 +55,20 @@ class Downsample(nn.Module):
         return x
 
 
+class Upsample(nn.Module):
+    def __init__(self, in_channel, with_conv=True):
+        super(Upsample, self).__init__()
+        self.with_conv = with_conv
+        if self.with_conv:
+            self.conv = nn.Conv2d(in_channel, in_channel, kernel_size=3, stride=1, padding=1)
+
+    def forward(self, x):
+        x = F.interpolate(x, scale_factor=2.0, mode="nearest")
+        if self.with_conv:
+            x = self.conv(x)
+        return x
+
+
 class ResnetBlock(nn.Module):
     """
     in_channel: input channel or can be seen as dim
@@ -331,8 +345,8 @@ class Decoder(nn.Module):
     attn_resolution: [16]
     in_channel: input dim , out_channel: output dim
     """
-    def __init__(self, in_channel, out_channel, h_channel, z_channel,
-                 n_res_layers, resolution, attn_resolution, ch_mult=(1, 2, 4, 8), dropout=0.0, resample_with_conv=True):
+    def __init__(self, in_channel, out_channel, h_channel, z_channel,n_res_layers,
+                 resolution, attn_resolution, ch_mult=(1, 2, 4, 8), dropout=0.0, resample_with_conv=True, eps=1e-6):
         super(Decoder, self).__init__()
         self.num_resolutions = len(ch_mult) # 4
         self.num_res_layers = n_res_layers
@@ -341,20 +355,59 @@ class Decoder(nn.Module):
         # upsample, z_channel(256) -> hidden_channel, in and out channel:
         # encoder里downsample了num_resolutions -1 次（3次），last resolution: 32
         # （res_in其实应该是output resolution，这里 128 x 8 即超分放大了4倍
+        # decoder里对res_in对应的其实是encoder里的res_out，一切都反过来
+
         res_in = h_channel * ch_mult[-1]
-        cur_resolution = resolution // 2 ** (self.num_resolutions - 1)
+        cur_resolution = resolution // 2 ** (self.num_resolutions - 1) # 32
         self.z_shape = (1, z_channel, cur_resolution, cur_resolution)
         print("Working with z of shape {} = {} dimensions.".format(self.z_shape, np.prod(self.z_shape)))
 
+        # 这里先把encoder last layer几层的转换转回来
+        self.conv_in = nn.Conv2d(z_channel, res_in, kernel_size=3, stride=1, padding=1)
+        # middle layer
+        self.middle_layers = nn.ModuleList([
+            ResnetBlock(res_in, res_in, dropout),
+            AttnBlock(res_in),
+            ResnetBlock(res_in, res_in, dropout)
+        ])
+        # upsample layers
+        self.upsample_layers = nn.ModuleList()
+        for i_level in range(self.num_resolutions - 1, -1, -1):
+            resstack = nn.ModuleList()
+            attnstack = nn.ModuleList()
+            upstack = nn.ModuleList()
+            res_out = h_channel * ch_mult[i_level]
+            for i_block in range(self.num_res_layers + 1):
+                resstack.append(ResnetBlock(res_in, res_out, dropout=dropout))
+                res_in = res_out
+                if cur_resolution in attn_resolution:
+                    attnstack.append(AttnBlock(res_in))
+
+            if i_level != 0: # not last layer, upsample, current resolution need to adjust
+                upstack.append(Upsample(res_out, resample_with_conv))
+                cur_resolution *= 2
+
+            self.upsample_layers.append(resstack)
+            self.upsample_layers.append(attnstack)
+            self.upsample_layers.append(upstack)
+
+        # last layer 这里的out_conv和encoder里的conv_in对应, 不过和encoder最后很像，要先out_norm, nonlinear, 最后out_cnov
+        self.out_norm = nn.GroupNorm(num_groups=32, num_channels=res_out, eps=eps, affin=True)
+        self.out_conv = nn.Conv2d(res_out, out_channel, kernel_size=3, stride=1, padding=1)
 
     def forward(self, z):
         self.last_z_shape = z.shape
+        # z back into res_in
         x = self.conv_in(z)
-
-
-
-
-
+        # middle layer
+        x = self.middle_layers(x)
+        # upsample
+        x = self.upsample_layers(x)
+        # end
+        x = self.out_norm(x)
+        x = nonlinear(x)
+        x = self.out_conv(x)
+        return x
 
 
 if __name__ == '__main__':
