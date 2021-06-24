@@ -10,7 +10,8 @@ class VQGAN(nn.Module):
     traditional official VQ-VAE-2 input: 256x256, bottom: 64x64, top: 32x32 1, 4, 8 downsample
     Timing: input: 256x256, downsample: 1, 1, 2, 4, 8 layer
     """
-    def __init__(self, in_channel, z_channel, h_channel, n_res_layers, resolution, attn_resolution,
+
+    def __init__(self, in_channel, z_channel, h_channel, out_channel, n_res_layers, resolution, attn_resolution,
                  embed_dim, n_embed, beta=0.25):
         super(VQGAN, self).__init__()
         self.encoder = Encoder(in_channel=in_channel, z_channel=z_channel, h_channel=h_channel,
@@ -18,15 +19,16 @@ class VQGAN(nn.Module):
         self.quant_conv = nn.Conv2d(z_channel, embed_dim, kernel_size=1, stride=1, padding=0)
         self.quantize = VectorQuantizer(n_embed=n_embed, embed_dim=embed_dim, beta=beta)
         self.pos_quant_conv = nn.Conv2d(embed_dim, z_channel, kernel_size=1, stride=1, padding=0)
-        self.decoder = Decoder()
+        self.decoder = Decoder(out_channel=out_channel, h_channel=h_channel, z_channel=z_channel,
+                               n_res_layers=n_res_layers, resolution=resolution, attn_resolution=attn_resolution)
 
     def forward(self, x):
         z = self.encoder(x)
         z = self.quant_conv(z)
         quant, embed_loss, info = self.quantize(z)
         quant = self.pos_quant_conv(quant)
-        dec = self.decoder(quant)
-
+        output = self.decoder(quant)
+        return output, embed_loss
 
 
 def nonlinear(x):
@@ -38,7 +40,8 @@ class Downsample(nn.Module):
     TODO: asymmetric padding, still confused... maybe in the original VQ-VAE-2 paper...?
     maybe ACNe? see https://arxiv.org/pdf/1908.03930.pdf and VQ-VAE-2 and also Taming paper for more details
     """
-    def __init__(self, in_channel, with_conv = True):
+
+    def __init__(self, in_channel, with_conv=True):
         super(Downsample, self).__init__()
         self.with_conv = with_conv
         if self.with_conv:
@@ -74,7 +77,8 @@ class ResnetBlock(nn.Module):
     in_channel: input channel or can be seen as dim
     out_channel: out dim
     """
-    def __init__(self, in_channel,out_channel, dropout, eps=1e-6, conv_shortcut=False):
+
+    def __init__(self, in_channel, out_channel, dropout, eps=1e-6, conv_shortcut=False):
         super(ResnetBlock, self).__init__()
         self.norm1 = nn.GroupNorm(num_groups=32, num_channels=in_channel, eps=eps, affine=True)
         # after each norm, add a nonlinear(x) layer in forward process
@@ -106,7 +110,7 @@ class ResnetBlock(nn.Module):
 
 
 class ResnetStack(nn.Module):
-    def __init__(self, in_channel,out_channel, dropout, n_res_layers):
+    def __init__(self, in_channel, out_channel, dropout, n_res_layers):
         super(ResnetStack, self).__init__()
         self.stack = nn.ModuleList([ResnetBlock(in_channel, out_channel, dropout=dropout)] * n_res_layers)
 
@@ -124,7 +128,7 @@ class AttnBlock(nn.Module):
         self.q = nn.Conv2d(in_channel, in_channel, kernel_size=1, stride=1, padding=0)
         self.k = nn.Conv2d(in_channel, in_channel, kernel_size=1, stride=1, padding=0)
         self.v = nn.Conv2d(in_channel, in_channel, kernel_size=1, stride=1, padding=0)
-        self.proj_out = nn.Conv2d(in_channel,in_channel, kernel_size=1, stride=1, padding=0)
+        self.proj_out = nn.Conv2d(in_channel, in_channel, kernel_size=1, stride=1, padding=0)
 
     def forward(self, input):
         output = self.norm(input)
@@ -135,20 +139,20 @@ class AttnBlock(nn.Module):
         # compute attention
         b, c, h, w = q.shape
         q = q.reshape(b, c, h * w)
-        q = q.permute(0, 2, 1) # b, h*w, c
-        k = k.reshape(b, c, h * w) # b, c, h*w
-        w = torch.bmm(q, k) # b, hw, hw
-        w = F.softmax(w, dim=2) # row softmax
+        q = q.permute(0, 2, 1)  # b, h*w, c
+        k = k.reshape(b, c, h * w)  # b, c, h*w
+        w = torch.bmm(q, k)  # b, hw, hw
+        w = F.softmax(w, dim=2)  # row softmax
 
         # attend to values
-        v = v.reshape(b, c, h*w)
-        w = w.permute(0, 2, 1) # col softmax, multi v = attention value
-        h = torch.bmm(v, w) # b, c, hw
+        v = v.reshape(b, c, h * w)
+        w = w.permute(0, 2, 1)  # col softmax, multi v = attention value
+        h = torch.bmm(v, w)  # b, c, hw
         h = h.reshape(b, c, h, w)
 
         h = self.proj_out(h)
 
-        return input + h # residual connection,
+        return input + h  # residual connection,
 
 
 class ResidualLayer(nn.Module):
@@ -159,6 +163,7 @@ class ResidualLayer(nn.Module):
     residual block: output = input + F(input)
     abandoned, used in VQ-VAE, but here we use VQ-VAE-2.
     """
+
     def __init__(self, in_dim, h_dim, res_h_dim):
         super(ResidualLayer, self).__init__()
         self.res_block = nn.Sequential(
@@ -199,20 +204,21 @@ class Encoder(nn.Module):
     resolution: 256 (256, 256, 3)
     attn_resolution = [16]
     """
+
     def __init__(self, in_channel, z_channel, h_channel,
                  n_res_layers, resolution, attn_resolution, ch_mult=(1, 2, 4, 8), dropout=0.0, resample_with_conv=True,
                  eps=1e-6):
         super(Encoder, self).__init__()
-        self.num_resolutions = len(ch_mult) # 4
+        self.num_resolutions = len(ch_mult)  # 4
         self.num_res_layers = n_res_layers
-        in_ch_mult = (1, ) + tuple(ch_mult) # (1, 1, 2, 4, 8), multi-resolution input channel
+        in_ch_mult = (1,) + tuple(ch_mult)  # (1, 1, 2, 4, 8), multi-resolution input channel
         # input and output channel: (128, 128) -> (128, 128*2) ->(128*2, 128*4) -> (128*4, 128*8)
         # and last layer conv input into z_channel(256): 128*8, 256
 
         # downsample
         self.conv_in = nn.Conv2d(in_channel, h_channel, kernel_size=3, stride=1, padding=1)
         self.downsample_layers = nn.ModuleList()
-        cur_resolution = resolution # 256
+        cur_resolution = resolution  # 256
 
         for i_level in range(self.num_resolutions):
             resstack = nn.ModuleList()
@@ -224,13 +230,13 @@ class Encoder(nn.Module):
                 # 这里由于multi-resolution还加了一个attention的原因，所以没有直接用ResnetStack
                 # 不是很清楚为什么在resolution=16的时候加了一个AttenBlock，感觉可以去掉试试看看对比效果
                 resstack.append(ResnetBlock(res_in, res_out, dropout=dropout))
-                res_in = res_out # out_channel update
+                res_in = res_out  # out_channel update
                 if cur_resolution in attn_resolution:
                     attnstack.append(AttnBlock(res_out))
 
-            if i_level != self.num_resolutions - 1: # not last layer, downsample, current resolution need to adjust
+            if i_level != self.num_resolutions - 1:  # not last layer, downsample, current resolution need to adjust
                 downstack.append(Downsample(res_out, resample_with_conv))
-                cur_resolution //= 2 # init 256: -> 128, 64, 32
+                cur_resolution //= 2  # init 256: -> 128, 64, 32
 
             self.downsample_layers.append(resstack)
             self.downsample_layers.append(attnstack)
@@ -273,7 +279,9 @@ class VectorQuantizer(nn.Module):
     ————————————————————
     input: embed_dim tensor (b, c, h, w) -> flatten into (b*h*w, c)
     output: z_q (discrete)
+    here embed_dim=256, n_embed=1024
     """
+
     def __init__(self, n_embed, embed_dim, beta):
         super(VectorQuantizer, self).__init__()
         self.embed_dim = embed_dim
@@ -345,10 +353,11 @@ class Decoder(nn.Module):
     attn_resolution: [16]
     in_channel: input dim , out_channel: output dim
     """
-    def __init__(self, out_channel, h_channel, z_channel,n_res_layers,
+
+    def __init__(self, out_channel, h_channel, z_channel, n_res_layers,
                  resolution, attn_resolution, ch_mult=(1, 2, 4, 8), dropout=0.0, resample_with_conv=True, eps=1e-6):
         super(Decoder, self).__init__()
-        self.num_resolutions = len(ch_mult) # 4
+        self.num_resolutions = len(ch_mult)  # 4
         self.num_res_layers = n_res_layers
 
         # top to bottom layer, top with the lowest resolution
@@ -357,7 +366,7 @@ class Decoder(nn.Module):
         # （res_in其实应该是output resolution，这里 128 x 8 即超分放大了4倍
         # decoder里对res_in对应的其实是encoder里的res_out，一切都反过来
         res_in = h_channel * ch_mult[-1]
-        cur_resolution = resolution // 2 ** (self.num_resolutions - 1) # 32
+        cur_resolution = resolution // 2 ** (self.num_resolutions - 1)  # 32
         self.z_shape = (1, z_channel, cur_resolution, cur_resolution)
         print("Working with z of shape {} = {} dimensions.".format(self.z_shape, np.prod(self.z_shape)))
 
@@ -383,13 +392,13 @@ class Decoder(nn.Module):
                 if cur_resolution in attn_resolution:
                     attnstack.append(AttnBlock(res_in))
 
-            if i_level != 0: # not last layer, upsample, current resolution need to adjust
+            if i_level != 0:  # not last layer, upsample, current resolution need to adjust
                 upstack.append(Upsample(res_out, resample_with_conv))
                 cur_resolution *= 2
             self.upsample_layers.append(upstack)
             self.upsample_layers.append(attnstack)
             self.upsample_layers.append(resstack)
-        self.upsample_layers = self.upsample_layers[: : -1]
+        self.upsample_layers = self.upsample_layers[:: -1]
 
         # last layer 这里的out_conv和encoder里的conv_in对应, 不过和encoder最后很像，要先out_norm, nonlinear, 最后out_cnov
         self.out_norm = nn.GroupNorm(num_groups=32, num_channels=res_out, eps=eps, affine=True)
