@@ -356,7 +356,6 @@ class Decoder(nn.Module):
         # encoder里downsample了num_resolutions -1 次（3次），last resolution: 32
         # （res_in其实应该是output resolution，这里 128 x 8 即超分放大了4倍
         # decoder里对res_in对应的其实是encoder里的res_out，一切都反过来
-
         res_in = h_channel * ch_mult[-1]
         cur_resolution = resolution // 2 ** (self.num_resolutions - 1) # 32
         self.z_shape = (1, z_channel, cur_resolution, cur_resolution)
@@ -377,6 +376,7 @@ class Decoder(nn.Module):
             attnstack = nn.ModuleList()
             upstack = nn.ModuleList()
             res_out = h_channel * ch_mult[i_level]
+            print("res_out: ", res_out)
             for i_block in range(self.num_res_layers + 1):
                 resstack.append(ResnetBlock(res_in, res_out, dropout=dropout))
                 res_in = res_out
@@ -386,10 +386,10 @@ class Decoder(nn.Module):
             if i_level != 0: # not last layer, upsample, current resolution need to adjust
                 upstack.append(Upsample(res_out, resample_with_conv))
                 cur_resolution *= 2
-
-            self.upsample_layers.append(resstack)
-            self.upsample_layers.append(attnstack)
             self.upsample_layers.append(upstack)
+            self.upsample_layers.append(attnstack)
+            self.upsample_layers.append(resstack)
+        self.upsample_layers = self.upsample_layers[: : -1]
 
         # last layer 这里的out_conv和encoder里的conv_in对应, 不过和encoder最后很像，要先out_norm, nonlinear, 最后out_cnov
         self.out_norm = nn.GroupNorm(num_groups=32, num_channels=res_out, eps=eps, affine=True)
@@ -414,7 +414,7 @@ if __name__ == '__main__':
     encoder = Encoder(in_channel=3, z_channel=256, h_channel=128, n_res_layers=2, resolution=256, attn_resolution=[16])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     encoder = encoder.to(device)
-    print(encoder)
+    # print(encoder)
     print("----------")
     decoder = Decoder(out_channel=3, h_channel=128, z_channel=256, n_res_layers=2, resolution=256, attn_resolution=[16])
     device = decoder.to(device)
