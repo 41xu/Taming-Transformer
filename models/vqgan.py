@@ -218,11 +218,16 @@ class Encoder(nn.Module):
         self.out_conv = nn.Conv2d(res_out, z_channel, kernel_size=3, stride=1, padding=1)
 
     def forward(self, x):
-        hidden_layers = [self.conv_in(x)]
+        x = [self.conv_in(x)]
         # bottom layer, downsample
         x = self.downsample_layers(x)
         # middle layer
+        x = self.middle_layers(x)
         # top layer, end
+        x = self.out_norm(x)
+        x = nonlinear(x)
+        x = self.out_conv(x)
+        return x
 
 
 
@@ -237,3 +242,10 @@ class VectorQuantizer(nn.Module):
     def __init__(self):
         super(VectorQuantizer, self).__init__()
         pass
+
+
+if __name__ == '__main__':
+    model = Encoder(in_channel=3, z_channel=256, h_channel=128, n_res_layers=2, resolution=256, attn_resolution=[16])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    print(model)
